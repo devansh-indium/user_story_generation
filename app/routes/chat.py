@@ -1,13 +1,15 @@
 from flask import Blueprint, request, jsonify, session
 from app import db
-from app.models.conversation import Conversation
+from app.models.conversation import Conversation, ConversationEmbedding
 from app.agents.input_agent import process_input
 from app.agents.context_agent import enrich_with_context
 from app.agents.jira_agent import execute_jira_task
 from app.agents.response_agent import generate_response
 from app.utils.file_reader import extract_text, truncate_text, is_image
 from app.utils.image_analyser import analyse_image
+from app.utils.embedder import get_embedding
 import uuid
+import json
 
 chat_bp = Blueprint("chat", __name__)
 
@@ -114,14 +116,20 @@ def chat():
     input_result = process_input(full_message)
     print(f"Input agent result: {input_result}")
 
-    enriched = enrich_with_context(history, input_result)
+    # Pass session_id and user_message so context agent can do RAG retrieval
+    enriched = enrich_with_context(
+        history,
+        input_result,
+        session_id=session_id,
+        user_message=message
+    )
     print(f"Enriched request: {enriched}")
 
     # Handle bulk ticket creation (list of tickets from document)
     details = enriched.get("extracted_details", {})
 
     if isinstance(details, list):
-        results  = []
+        results = []
         for ticket in details:
             single = {**enriched, "extracted_details": ticket}
             result = execute_jira_task(single, platform=platform)
@@ -142,7 +150,7 @@ def chat():
     print(f"Final response: {final_response}")
 
     # ---------------------------------------------------------------------------
-    # Save to database
+    # Save conversation to database
     # ---------------------------------------------------------------------------
     user_content = message
     if file_filename:
@@ -151,6 +159,21 @@ def chat():
     db.session.add(Conversation(session_id=session_id, role="user",      content=user_content))
     db.session.add(Conversation(session_id=session_id, role="assistant", content=final_response))
     db.session.commit()
+
+    # ---------------------------------------------------------------------------
+    # Store embeddings for RAG retrieval in future conversations
+    # ---------------------------------------------------------------------------
+    try:
+        if isinstance(details, list):
+            # Bulk creation — embed each ticket individually
+            for i, ticket in enumerate(details):
+                ticket_result = task_result["results"][i] if i < len(task_result.get("results", [])) else {}
+                _store_embedding(session_id, message, ticket, ticket_result, platform)
+        else:
+            _store_embedding(session_id, message, details, task_result, platform)
+    except Exception as e:
+        # Embedding failure is non-fatal — never block the main response
+        print(f"Embedding storage error (non-fatal): {e}")
 
     # ---------------------------------------------------------------------------
     # Response
@@ -170,12 +193,65 @@ def chat():
     return jsonify(response_data)
 
 
-# @chat_bp.route("/history", methods=[\"GET\"])
-# def history():
-#     session_id = session.get("session_id")
-#     if not session_id:
-#         return jsonify({"history": []})
-#     rows = Conversation.query.filter_by(
-#         session_id=session_id
-#     ).order_by(Conversation.created_at).all()
-#     return jsonify({"history": [r.to_dict() for r in rows]})
+# ---------------------------------------------------------------------------
+# EMBEDDING HELPER
+# ---------------------------------------------------------------------------
+
+def _store_embedding(session_id: str, message: str, details: dict,
+                     task_result: dict, platform: str):
+    """
+    Generate and store a vector embedding for a ticket or conversation.
+    This powers the RAG retrieval in context_agent.
+
+    The embedding captures:
+    - The original user message
+    - The ticket summary and type
+    - The ticket ID and platform
+    So future queries like "find the login bug" retrieve this record.
+    """
+    ticket_id  = task_result.get("ticket_id", "")
+    issue_type = details.get("issue_type", "") if isinstance(details, dict) else ""
+    summary    = details.get("summary", "")    if isinstance(details, dict) else ""
+    labels     = details.get("labels", [])     if isinstance(details, dict) else []
+
+    # Only store embeddings when a ticket was actually created
+    if not ticket_id:
+        return
+
+    # Build rich descriptive text — more context = better semantic search
+    content = (
+        f"user request: {message} | "
+        f"summary: {summary} | "
+        f"type: {issue_type} | "
+        f"labels: {', '.join(labels)} | "
+        f"platform: {platform} | "
+        f"ticket_id: {ticket_id}"
+    )
+
+    vector = get_embedding(content)
+
+    db.session.add(ConversationEmbedding(
+        session_id  = session_id,
+        content     = content,
+        ticket_id   = ticket_id,
+        ticket_type = issue_type,
+        platform    = platform,
+        embedding   = json.dumps(vector)
+    ))
+    db.session.commit()
+    print(f"Embedding stored for ticket {ticket_id} ({len(vector)} dims)")
+
+
+# ---------------------------------------------------------------------------
+# HISTORY ROUTE
+# ---------------------------------------------------------------------------
+
+@chat_bp.route("/history", methods=["GET"])
+def history():
+    session_id = session.get("session_id")
+    if not session_id:
+        return jsonify({"history": []})
+    rows = Conversation.query.filter_by(
+        session_id=session_id
+    ).order_by(Conversation.created_at).all()
+    return jsonify({"history": [r.to_dict() for r in rows]})
