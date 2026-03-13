@@ -2,6 +2,17 @@ import os
 import io
 
 
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def is_image(file) -> bool:
+    """Check if uploaded file is an image based on extension."""
+    ext = os.path.splitext(file.filename.lower())[1]
+    return ext in IMAGE_EXTENSIONS
+
+
+
 def extract_text(file) -> str:
     """
     Extract plain text from an uploaded file.
@@ -31,7 +42,8 @@ def extract_text(file) -> str:
     else:
         raise ValueError(
             f"Unsupported file type: {extension}. "
-            "Supported types: .txt, .md, .pdf, .docx, .xlsx, .csv"
+            "Supported types: .txt, .md, .pdf, .docx, .xlsx, .csv, "
+            ".png, .jpg, .jpeg, .webp, .gif (images handled separately)"
         )
 
 
@@ -80,7 +92,7 @@ def _read_docx(file) -> str:
         if para.text.strip():
             lines.append(para.text.strip())
 
-    # Also extract text from tables
+    
     for table in document.tables:
         for row in table.rows:
             cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
@@ -117,9 +129,6 @@ def _read_csv(file) -> str:
     return file.read().decode("utf-8", errors="ignore").strip()
 
 
-# ---------------------------------------------------------------------------
-# TRUNCATE
-# ---------------------------------------------------------------------------
 
 def truncate_text(text: str, max_chars: int = 8000) -> str:
     """

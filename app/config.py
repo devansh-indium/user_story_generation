@@ -18,6 +18,8 @@ class Config:
     AZURE_OPENAI_ENDPOINT   = os.getenv("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_API_KEY    = os.getenv("AZURE_OPENAI_API_KEY")
     AZURE_FOUNDRY_PROJECT_ENDPOINT = os.getenv("AZURE_FOUNDRY_PROJECT_ENDPOINT")
+    AZURE_OPENAI_VISION_DEPLOYMENT = os.getenv("AZURE_OPENAI_VISION_DEPLOYMENT", "gpt-4o")
+    AZURE_OPENAI_VISION_ENDPOINT   = os.getenv("AZURE_OPENAI_VISION_ENDPOINT")
     # ─── Jira ─────────────────────────────────────────────
     JIRA_BASE_URL     = os.getenv("JIRA_BASE_URL")
     JIRA_EMAIL        = os.getenv("JIRA_EMAIL")

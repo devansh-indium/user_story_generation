@@ -5,7 +5,8 @@ from app.agents.input_agent import process_input
 from app.agents.context_agent import enrich_with_context
 from app.agents.jira_agent import execute_jira_task
 from app.agents.response_agent import generate_response
-from app.utils.file_reader import extract_text, truncate_text
+from app.utils.file_reader import extract_text, truncate_text, is_image
+from app.utils.image_analyser import analyse_image
 import uuid
 
 chat_bp = Blueprint("chat", __name__)
@@ -17,12 +18,10 @@ def chat():
     # Parse request — supports both JSON and multipart/form-data (file uploads)
     # ---------------------------------------------------------------------------
     if request.content_type and "multipart/form-data" in request.content_type:
-        # File upload request
         message  = request.form.get("message", "")
         platform = request.form.get("platform", "jira")
         file     = request.files.get("file")
     else:
-        # Regular JSON request
         data     = request.get_json()
         message  = data.get("message", "")
         platform = data.get("platform", "jira")
@@ -36,39 +35,62 @@ def chat():
         return jsonify({"error": "platform must be 'jira' or 'devops'"}), 400
 
     # ---------------------------------------------------------------------------
-    # Extract file text if a file was uploaded
+    # Handle uploaded file — image or document
     # ---------------------------------------------------------------------------
-    file_text     = None
+    file_content  = None
     file_error    = None
     file_filename = None
+    file_type     = None   # "image" or "document"
 
     if file and file.filename:
+        file_filename = file.filename
         try:
-            raw_text      = extract_text(file)
-            file_text     = truncate_text(raw_text, max_chars=8000)
-            file_filename = file.filename
-            print(f"File uploaded: {file_filename} ({len(file_text)} chars extracted)")
-        except (ValueError, ImportError) as e:
+            if is_image(file):
+                # --- IMAGE: analyse with GPT-4o vision ---
+                file_type    = "image"
+                analysis     = analyse_image(file, context=message)
+                file_content = analysis
+                print(f"Image analysed: {file_filename} ({len(analysis)} chars)")
+
+            else:
+                # --- DOCUMENT: extract text ---
+                file_type    = "document"
+                raw_text     = extract_text(file)
+                file_content = truncate_text(raw_text, max_chars=8000)
+                print(f"Document extracted: {file_filename} ({len(file_content)} chars)")
+
+        except (ValueError, ImportError, RuntimeError) as e:
             file_error = str(e)
-            print(f"File read error: {file_error}")
+            print(f"File processing error: {file_error}")
 
     # ---------------------------------------------------------------------------
-    # Build the full message for the agent
+    # Build the full message for the input agent
     # ---------------------------------------------------------------------------
-    if file_text:
+    if file_content and file_type == "image":
+        full_message = (
+            f"{message}\n\n"
+            f"--- ATTACHED IMAGE ANALYSIS: {file_filename} ---\n"
+            f"{file_content}\n"
+            f"--- END OF IMAGE ANALYSIS ---\n\n"
+            f"Use the image analysis above to populate the ticket description, "
+            f"steps to reproduce, environment details, and any other relevant fields."
+        )
+    elif file_content and file_type == "document":
         full_message = (
             f"{message}\n\n"
             f"--- ATTACHED DOCUMENT: {file_filename} ---\n"
-            f"{file_text}\n"
+            f"{file_content}\n"
             f"--- END OF DOCUMENT ---"
         )
     else:
         full_message = message
 
-    # Log for debugging
+    # Logging
     print(f"Received message: {message} | Platform: {platform}")
     if file_filename:
-        print(f"With attached file: {file_filename}")
+        print(f"With attached {file_type}: {file_filename}")
+    if file_error:
+        print(f"File error: {file_error}")
 
     # ---------------------------------------------------------------------------
     # Session management
@@ -95,7 +117,25 @@ def chat():
     enriched = enrich_with_context(history, input_result)
     print(f"Enriched request: {enriched}")
 
-    task_result = execute_jira_task(enriched, platform=platform)
+    # Handle bulk ticket creation (list of tickets from document)
+    details = enriched.get("extracted_details", {})
+
+    if isinstance(details, list):
+        results  = []
+        for ticket in details:
+            single = {**enriched, "extracted_details": ticket}
+            result = execute_jira_task(single, platform=platform)
+            results.append(result)
+            print(f"Created ticket: {result}")
+        task_result = {
+            "status":  "success",
+            "bulk":    True,
+            "results": results,
+            "summary": f"{sum(1 for r in results if r.get('status') == 'success')} tickets created."
+        }
+    else:
+        task_result = execute_jira_task(enriched, platform=platform)
+
     print(f"Task execution result: {task_result}")
 
     final_response = generate_response(task_result, message)
@@ -106,7 +146,7 @@ def chat():
     # ---------------------------------------------------------------------------
     user_content = message
     if file_filename:
-        user_content += f" [Attached: {file_filename}]"
+        user_content += f" [Attached {file_type}: {file_filename}]"
 
     db.session.add(Conversation(session_id=session_id, role="user",      content=user_content))
     db.session.add(Conversation(session_id=session_id, role="assistant", content=final_response))
@@ -122,6 +162,7 @@ def chat():
 
     if file_filename:
         response_data["file_processed"] = file_filename
+        response_data["file_type"]      = file_type
 
     if file_error:
         response_data["file_error"] = file_error
@@ -129,12 +170,12 @@ def chat():
     return jsonify(response_data)
 
 
-@chat_bp.route("/history", methods=["GET"])
-def history():
-    session_id = session.get("session_id")
-    if not session_id:
-        return jsonify({"history": []})
-    rows = Conversation.query.filter_by(
-        session_id=session_id
-    ).order_by(Conversation.created_at).all()
-    return jsonify({"history": [r.to_dict() for r in rows]})
+# @chat_bp.route("/history", methods=[\"GET\"])
+# def history():
+#     session_id = session.get("session_id")
+#     if not session_id:
+#         return jsonify({"history": []})
+#     rows = Conversation.query.filter_by(
+#         session_id=session_id
+#     ).order_by(Conversation.created_at).all()
+#     return jsonify({"history": [r.to_dict() for r in rows]})
